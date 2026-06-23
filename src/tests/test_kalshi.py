@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from _fb_types import SourceQuestionBank
 from _schemas import KalshiFetchFrame, QuestionFrame, ResolutionFrame
@@ -12,7 +13,7 @@ from resolve._impute import impute_missing_forecasts
 from resolve._prepare import check_and_prepare_forecast_file, set_resolution_dates
 from resolve.explode_question_set import explode_question_set
 from resolve.resolve_all import resolve_all
-from sources.kalshi import KalshiSource
+from sources.kalshi import KalshiSource, MarketNotFoundError
 from sources.registry import SOURCES
 
 from .conftest import (
@@ -428,6 +429,20 @@ class TestGetMarket:
         result = kalshi_source._get_market("KXTEST-001")
         assert result["ticker"] == "KXTEST-001"
 
+    @patch("sources.kalshi.time.sleep")
+    @patch("sources.kalshi.requests.get")
+    def test_404_raises_market_not_found(self, mock_get, mock_sleep, kalshi_source):
+        """A 404 raises the non-retryable MarketNotFoundError (so update can skip it)."""
+        resp = Mock()
+        resp.status_code = 404
+        resp.ok = False
+        mock_get.return_value = resp
+
+        with pytest.raises(MarketNotFoundError):
+            kalshi_source._get_market("KXGONE-001")
+        # Non-retryable: backoff only retries RequestException, so the call happens exactly once.
+        assert mock_get.call_count == 1
+
 
 class TestGetMarketCandlesticks:
     """Tests for KalshiSource._get_market_candlesticks."""
@@ -676,6 +691,21 @@ class TestUpdate:
 
         result = kalshi_source.update(dfq, dff)
         QuestionFrame.validate(result.dfq)
+
+    @patch.object(KalshiSource, "_build_resolution_df")
+    @patch.object(KalshiSource, "_get_market")
+    def test_skips_market_not_found(self, mock_market, mock_build, kalshi_source):
+        """A delisted (404) market is skipped rather than crashing the whole update."""
+        mock_market.side_effect = MarketNotFoundError("KXTEST-001")
+        dfq = make_question_df([{"id": "KXTEST-001", "resolved": False}])
+        dff = make_kalshi_fetch_df([{"id": "KXTEST-001"}])
+
+        result = kalshi_source.update(dfq, dff)
+
+        # Row retained untouched; no resolution file built for the missing market.
+        assert "KXTEST-001" in result.dfq["id"].values
+        assert "KXTEST-001" not in (result.resolution_files or {})
+        mock_build.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

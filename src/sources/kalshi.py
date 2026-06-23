@@ -46,6 +46,20 @@ _CANDLESTICK_PERIOD_INTERVAL = 1440  # daily candlesticks
 _RESOLVED_STATUSES = {"settled", "finalized", "determined"}
 
 
+class MarketNotFoundError(Exception):
+    """Raised when a Kalshi market ticker no longer exists (404).
+
+    Deliberately not a ``requests.exceptions.RequestException`` so the ``@backoff`` retry on
+    ``_get_market`` does not waste retries on a permanently-missing market, and so ``update()`` can
+    skip the question instead of crashing the whole job.
+    """
+
+    def __init__(self, ticker: str):
+        """Initialize the error with the ticker that could not be found."""
+        self.ticker = ticker
+        super().__init__(f"Kalshi market not found for ticker {ticker}.")
+
+
 class KalshiSource(MarketSource):
     """Kalshi prediction market source."""
 
@@ -115,6 +129,7 @@ class KalshiSource(MarketSource):
         existing_resolution_files = existing_resolution_files or {}
         existing_resolution_ids = existing_resolution_ids or set()
         resolution_files: dict[str, pd.DataFrame] = {}
+        not_found_ids: list[str] = []
 
         # --- Append new tickers from dff to dfq (capped to keep the pool bounded) ---
         new_ids = dff[~dff["id"].isin(dfq["id"])]["id"]
@@ -129,14 +144,22 @@ class KalshiSource(MarketSource):
             # Cap new additions so the unresolved pool stays under _QUESTION_LIMIT
             max_to_add = _QUESTION_LIMIT - len(dfq[dfq["resolved"] == False])  # noqa: E712
             if max_to_add > 0:
-                # !!!!!!!!!!!!! ASK HOUTAN: The usage of head here is problematic as ids/tickers in dataframe have been sorted by fetch(). Similar issue in metaculus source. We should probably use df_new.sample(n=max_to_add) but keeping df_new.head mometarily for consistency with other sources.
+                # TODO(team): `.head()` keeps the alphabetically-first tickers (fetch() sorts ids),
+                # so the same subset is chosen every run when discovery exceeds the cap, biasing the
+                # pool. Kept for consistency with the metaculus source for now; open question whether
+                # to switch to `df_new.sample(n=max_to_add)`.
                 df_new = df_new.head(max_to_add)
                 dfq = pd.concat([dfq, df_new], ignore_index=True)
 
         # --- Update all unresolved questions ---
         dfq["resolved"] = dfq["resolved"].astype(bool)
         for index, row in dfq[~dfq["resolved"]].iterrows():
-            market = self._get_market(row["id"])
+            try:
+                market = self._get_market(row["id"])
+            except MarketNotFoundError:
+                # Market was delisted; leave the row untouched and move on rather than crash.
+                not_found_ids.append(str(row["id"]))
+                continue
 
             # Assign market details to dfq row
             dfq.at[index, "question"] = market["title"]
@@ -178,7 +201,11 @@ class KalshiSource(MarketSource):
         # --- Regenerate missing resolution files for resolved questions ---
         for _index, row in dfq[dfq["resolved"]].iterrows():
             if str(row["id"]) not in existing_resolution_ids and row["id"] not in resolution_files:
-                market = self._get_market(row["id"])
+                try:
+                    market = self._get_market(row["id"])
+                except MarketNotFoundError:
+                    not_found_ids.append(str(row["id"]))
+                    continue
                 df_res = self._build_resolution_df(
                     market=market,
                     market_info_resolution_datetime=row["market_info_resolution_datetime"],
@@ -191,6 +218,12 @@ class KalshiSource(MarketSource):
                         f"No resolution file built for resolved id={row['id']} "
                         "(no candlesticks / no usable price data)."
                     )
+
+        if not_found_ids:
+            logger.warning(
+                f"Skipped {len(not_found_ids)} question(s) whose market 404'd "
+                f"(delisted/removed): {sorted(not_found_ids)}"
+            )
 
         return UpdateResult(
             dfq=dfq,
@@ -243,7 +276,9 @@ class KalshiSource(MarketSource):
                     max_resolution_date=max_resolution_date,
                     in_category=in_category,
                 ):
-                    tickers.add(market["ticker"])
+                    ticker = market.get("ticker")
+                    if ticker:
+                        tickers.add(ticker)
         return tickers, data.get("cursor")
 
     def _search_markets(
@@ -282,18 +317,24 @@ class KalshiSource(MarketSource):
         is either in a target category or trending. The upper bound excludes perpetual novelty
         markets (closing decades out) that pass the liquidity floors on cumulative volume.
         """
+        # Use defensive `.get()` access throughout: a single market missing a field would
+        # otherwise raise a KeyError that backoff does not catch (it is not a RequestException),
+        # crashing the entire nightly discovery. Missing liquidity -> 0 -> excluded.
         if market.get("market_type") != "binary":
             return False
-        if float(market["volume_fp"]) < _MIN_VOLUME:
+        if float(market.get("volume_fp") or 0) < _MIN_VOLUME:
             return False
-        if float(market["open_interest_fp"]) < _MIN_OPEN_INTEREST:
+        if float(market.get("open_interest_fp") or 0) < _MIN_OPEN_INTEREST:
             return False
-        close_date = dates.convert_zulu_to_datetime(market["close_time"]).date()
+        close_time = market.get("close_time")
+        if not close_time:
+            return False
+        close_date = dates.convert_zulu_to_datetime(close_time).date()
         if close_date < min_resolution_date:
             return False
         if max_resolution_date is not None and close_date > max_resolution_date:
             return False
-        trending = float(market.get("volume_24h_fp", 0)) >= _MIN_TRENDING_24H_VOLUME
+        trending = float(market.get("volume_24h_fp") or 0) >= _MIN_TRENDING_24H_VOLUME
         return in_category or trending
 
     # ------------------------------------------------------------------
@@ -314,6 +355,11 @@ class KalshiSource(MarketSource):
         logger.info(f"Calling market endpoint for {ticker}")
         endpoint = f"{_KALSHI_API_BASE}/markets/{ticker}"
         response = requests.get(endpoint, verify=certifi.where())
+        if response.status_code == 404:
+            # Market was delisted/removed. Raise a non-retryable error so backoff stops and the
+            # caller can skip this question rather than aborting the whole update.
+            logger.warning(f"Market not found (404) for ticker {ticker}; skipping.")
+            raise MarketNotFoundError(ticker)
         if not response.ok:
             logger.error(f"Request to market endpoint failed for {ticker}.")
             response.raise_for_status()
