@@ -27,8 +27,15 @@ from .conftest import (
 )
 
 
-def _ts(year, month, day, hour=12):
-    """Return the unix timestamp (seconds) for a UTC datetime."""
+def _ts(year, month, day, hour=5):
+    """Return the unix timestamp (seconds) for a UTC datetime.
+
+    Defaults to 05:00 UTC, which is midnight ET during EST (winter) -- the real time-of-day at
+    which Kalshi's daily ``end_period_ts`` lands. Verified against the live API: every daily candle
+    ends at 04:00 UTC (EDT/summer) or 05:00 UTC (EST/winter), i.e. midnight ET. The dates used in
+    the tests below are in January (EST), so 05:00 UTC is the faithful boundary; pass ``hour=4`` to
+    model an EDT (summer) candle.
+    """
     return int(datetime(year, month, day, hour, tzinfo=timezone.utc).timestamp())
 
 
@@ -251,10 +258,34 @@ class TestBuildResolutionDf:
         )
 
         result_dates = pd.to_datetime(result["date"]).dt.date
-        # candle whose end_period_ts falls on 2026-01-12 is labeled 2026-01-11
+        # end_period_ts at 05:00 UTC on 2026-01-12 is midnight ET, i.e. the close of the 2026-01-11
+        # ET trading day, so the one-day shift labels it 2026-01-11.
         assert result_dates.min() == date(2026, 1, 11)
         first_val = result.loc[result_dates == date(2026, 1, 11), "value"].iloc[0]
         assert float(first_val) == 0.55
+
+    @patch.object(KalshiSource, "_get_market_candlesticks")
+    def test_candle_date_attribution_across_dst(self, mock_candles, kalshi_source, freeze_today):
+        """The fixed one-day shift lands on the right ET day in both EST and EDT.
+
+        Kalshi daily candles end at midnight ET: 05:00 UTC in winter (EST) and 04:00 UTC in summer
+        (EDT). Subtracting a fixed 24h must still attribute each candle to the correct prior ET
+        calendar day on both sides of the daylight-saving boundary.
+        """
+        freeze_today(date(2026, 8, 1))
+        mock_candles.return_value = [
+            # EST winter: 05:00 UTC 2026-01-12 == midnight ET -> close of the 2026-01-11 ET day.
+            make_kalshi_candlestick(_ts(2026, 1, 12, hour=5), close_dollars="0.20"),
+            # EDT summer: 04:00 UTC 2026-07-02 == midnight ET -> close of the 2026-07-01 ET day.
+            make_kalshi_candlestick(_ts(2026, 7, 2, hour=4), close_dollars="0.80"),
+        ]
+        result = kalshi_source._build_resolution_df(
+            market=make_kalshi_api_market(), market_info_resolution_datetime="N/A", existing_df=None
+        )
+
+        by_date = dict(zip(pd.to_datetime(result["date"]).dt.date, result["value"].astype(float)))
+        assert by_date[date(2026, 1, 11)] == 0.20
+        assert by_date[date(2026, 7, 1)] == 0.80
 
 
 # ---------------------------------------------------------------------------
